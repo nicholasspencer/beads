@@ -675,6 +675,61 @@ func TestGetRepoContext_BEADS_DIR_ExternalRepo(t *testing.T) {
 	}
 }
 
+// TestGetRepoContext_NonGitScope verifies that GetRepoContext tolerates a .beads
+// store living in a directory that is not itself a git repository — e.g. a Gas
+// City / HQ scope in dolt-server mode, which holds a .beads store but is not
+// version-controlled. Rather than failing with "cannot determine repository
+// root", it must fall back to the directory that contains .beads.
+func TestGetRepoContext_NonGitScope(t *testing.T) {
+	originalBeadsDir := os.Getenv("BEADS_DIR")
+	originalWd, _ := os.Getwd()
+	t.Cleanup(func() {
+		if originalBeadsDir != "" {
+			os.Setenv("BEADS_DIR", originalBeadsDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+		os.Chdir(originalWd)
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	// A plain, NON-git directory that holds a .beads store (no git init).
+	nonGitScope := t.TempDir()
+	beadsDir := filepath.Join(nonGitScope, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	// Resolve via cwd with no BEADS_DIR redirect, so we exercise the
+	// non-external branch where git.GetMainRepoRoot() fails.
+	os.Unsetenv("BEADS_DIR")
+	if err := os.Chdir(nonGitScope); err != nil {
+		t.Fatalf("failed to chdir into non-git scope: %v", err)
+	}
+	ResetCaches()
+	git.ResetCaches()
+
+	rc, err := GetRepoContext()
+	if err != nil {
+		t.Fatalf("GetRepoContext should tolerate a non-git scope, got error: %v", err)
+	}
+
+	// RepoRoot must fall back to the directory that contains .beads.
+	if want := resolveSymlinks(nonGitScope); rc.RepoRoot != want {
+		t.Errorf("RepoRoot = %q, want fallback to .beads parent %q", rc.RepoRoot, want)
+	}
+	if want := resolveSymlinks(beadsDir); rc.BeadsDir != want {
+		t.Errorf("BeadsDir = %q, want %q", rc.BeadsDir, want)
+	}
+	if rc.IsRedirected {
+		t.Error("IsRedirected should be false for a local non-git scope")
+	}
+}
+
 // TestRole_BEADS_DIR_ImpliesContributor tests that BEADS_DIR redirect
 // implicitly returns Contributor role without requiring git config.
 func TestRole_BEADS_DIR_ImpliesContributor(t *testing.T) {

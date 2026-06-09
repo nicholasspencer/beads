@@ -128,11 +128,16 @@ func buildRepoContext() (*RepoContext, error) {
 		// Beads dir is in a different repo - use that repo's root
 		repoRoot = repoRootForBeadsDir(beadsDir)
 	} else {
-		// Normal case - find repo root via git
+		// Normal case - find repo root via git.
 		var err error
 		repoRoot, err = git.GetMainRepoRoot()
 		if err != nil {
-			return nil, fmt.Errorf("cannot determine repository root: %w", err)
+			// No enclosing git repository (e.g. a non-git city/HQ scope that
+			// holds a .beads store but is not itself version-controlled). bd
+			// operates on the .beads store directly in dolt-server mode and
+			// does not need a git root here, so fall back to the directory
+			// that contains .beads rather than failing context resolution.
+			repoRoot = filepath.Dir(beadsDir)
 		}
 	}
 
