@@ -19,6 +19,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/ui"
 	"golang.org/x/term"
@@ -157,6 +158,58 @@ func isDivergedHistoryErr(err error) bool {
 		strings.Contains(msg, "cannot find common ancestor")
 }
 
+// isAncestorPKMismatchErr reports Dolt's hard refusal to merge a table whose
+// primary key set differs across the merging histories or in their common
+// ancestor. The classification lives in dberrors so the cross-upgrade merge
+// test (internal/storage/dolt) can pin it against a real Dolt refusal; see
+// dberrors.IsAncestorPKMismatch for the full background (#4259).
+func isAncestorPKMismatchErr(err error) bool {
+	return dberrors.IsAncestorPKMismatch(err)
+}
+
+// ancestorPKMismatchTable extracts the table name from a Dolt
+// different-primary-keys merge refusal, or "" if it cannot be determined.
+func ancestorPKMismatchTable(err error) string {
+	return dberrors.AncestorPKMismatchTable(err)
+}
+
+// printAncestorPKMismatchGuidance prints recovery guidance when a Dolt merge
+// is refused because a table's primary key set differs across the merging
+// histories or in their common ancestor. Unlike row conflicts, this cannot be
+// auto-resolved and does not converge on retry; the clones must be
+// re-converged through one canonical clone.
+func printAncestorPKMismatchGuidance(err error) {
+	w := os.Stderr
+	table := ancestorPKMismatchTable(err)
+	fmt.Fprintln(w, "")
+	if table != "" {
+		fmt.Fprintf(w, "Dolt refused to merge: table %q has different primary keys across\n", table)
+	} else {
+		fmt.Fprintln(w, "Dolt refused to merge: a table has different primary keys across")
+	}
+	fmt.Fprintln(w, "the local and remote histories (or in their common ancestor).")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "This is a schema fork: two clones reshaped the table's primary key")
+	fmt.Fprintln(w, "independently, usually by upgrading bd (and so running schema migrations)")
+	fmt.Fprintln(w, "separately on each clone while un-synced changes existed on both sides.")
+	fmt.Fprintln(w, "Retrying will not help — these histories can no longer be merged.")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Recovery (bootstrap from one canonical clone):")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "  1. Pick ONE clone as canonical (usually the most complete/up-to-date),")
+	fmt.Fprintln(w, "     upgrade bd there, and make the remote authoritative:")
+	fmt.Fprintln(w, "       bd dolt push --force")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "  2. On EVERY other clone, save local-only work, re-clone, re-apply:")
+	fmt.Fprintln(w, "       bd export --all -o /tmp/beads-local.jsonl")
+	fmt.Fprintln(w, "       rm -rf .beads/dolt")
+	fmt.Fprintln(w, "       bd bootstrap")
+	fmt.Fprintln(w, "       bd import /tmp/beads-local.jsonl")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Full playbook (and how to prevent this during upgrades):")
+	fmt.Fprintln(w, "  https://github.com/gastownhall/beads/blob/main/docs/RECOVERY.md#pk-fork-refused")
+}
+
 // printNoRemoteGuidance prints an informational message (to stdout) when
 // push or pull is attempted but no Dolt remote is configured. Exits 0 because
 // the absence of a remote is a valid configuration — not an error.
@@ -260,6 +313,8 @@ The remote must already exist (see 'bd dolt remote add').`,
 					fmt.Fprintf(os.Stderr, "\nRemote %q is not configured.\n", remote)
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote add <name> <url>' to add it.")
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote list' to see configured remotes.")
+				} else if isAncestorPKMismatchErr(err) {
+					printAncestorPKMismatchGuidance(err)
 				} else if isDivergedHistoryErr(err) {
 					printDivergedHistoryGuidance("push --force")
 				}
@@ -288,7 +343,9 @@ The remote must already exist (see 'bd dolt remote add').`,
 				return
 			}
 			fmt.Fprintf(os.Stderr, "Error: %v\n", pushErr)
-			if isDivergedHistoryErr(pushErr) {
+			if isAncestorPKMismatchErr(pushErr) {
+				printAncestorPKMismatchGuidance(pushErr)
+			} else if isDivergedHistoryErr(pushErr) {
 				op := "push"
 				if force {
 					op = "push --force"
@@ -328,6 +385,8 @@ The remote must already exist (see 'bd dolt remote add').`,
 					fmt.Fprintf(os.Stderr, "\nRemote %q is not configured.\n", remote)
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote add <name> <url>' to add it.")
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote list' to see configured remotes.")
+				} else if isAncestorPKMismatchErr(err) {
+					printAncestorPKMismatchGuidance(err)
 				} else if isDivergedHistoryErr(err) {
 					printDivergedHistoryGuidance("pull")
 				}
@@ -343,7 +402,9 @@ The remote must already exist (see 'bd dolt remote add').`,
 				return
 			}
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			if isDivergedHistoryErr(err) {
+			if isAncestorPKMismatchErr(err) {
+				printAncestorPKMismatchGuidance(err)
+			} else if isDivergedHistoryErr(err) {
 				printDivergedHistoryGuidance("pull")
 			}
 			os.Exit(1)
