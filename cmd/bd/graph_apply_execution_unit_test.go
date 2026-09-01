@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
@@ -12,9 +13,10 @@ import (
 
 type graphApplyFakeStore struct {
 	storage.DoltStorage
-	issues map[string]*types.Issue
-	deps   []*types.Dependency
-	nextID int
+	issues             map[string]*types.Issue
+	deps               []*types.Dependency
+	nextID             int
+	sqlCycleCheckCalls int
 }
 
 func newGraphApplyFakeStore() *graphApplyFakeStore {
@@ -82,14 +84,16 @@ func (s *graphApplyFakeStore) RunInTransaction(ctx context.Context, _ string, fn
 	s.issues = txStore.issues
 	s.deps = txStore.deps
 	s.nextID = txStore.nextID
+	s.sqlCycleCheckCalls = txStore.sqlCycleCheckCalls
 	return nil
 }
 
 func (s *graphApplyFakeStore) clone() *graphApplyFakeStore {
 	cp := &graphApplyFakeStore{
-		issues: make(map[string]*types.Issue, len(s.issues)),
-		deps:   make([]*types.Dependency, 0, len(s.deps)),
-		nextID: s.nextID,
+		issues:             make(map[string]*types.Issue, len(s.issues)),
+		deps:               make([]*types.Dependency, 0, len(s.deps)),
+		nextID:             s.nextID,
+		sqlCycleCheckCalls: s.sqlCycleCheckCalls,
 	}
 	for id, issue := range s.issues {
 		issueCopy := *issue
@@ -129,6 +133,9 @@ func (tx *graphApplyFakeTx) AddDependency(ctx context.Context, dep *types.Depend
 }
 
 func (tx *graphApplyFakeTx) AddDependencyWithOptions(_ context.Context, dep *types.Dependency, _ string, opts storage.DependencyAddOptions) error {
+	if !opts.SkipCycleCheck {
+		tx.store.sqlCycleCheckCalls++
+	}
 	for _, existing := range tx.store.deps {
 		if existing.IssueID == dep.IssueID && existing.DependsOnID == dep.DependsOnID {
 			if existing.Type == dep.Type {
@@ -205,6 +212,89 @@ func withGraphApplyFakeStore(t *testing.T) (context.Context, *graphApplyFakeStor
 		store, rootCtx, actor = oldStore, oldCtx, oldActor
 	})
 	return ctx, fakeStore
+}
+
+func TestExecuteGraphApplyUnitSkipsPlanLocalParentCycleChecksAtScale(t *testing.T) {
+	ctx, fakeStore := withGraphApplyFakeStore(t)
+	const closedRows = 6398
+	for i := 0; i < closedRows; i++ {
+		id := fmt.Sprintf("ga-closed-%04d", i)
+		fakeStore.issues[id] = &types.Issue{
+			ID:        id,
+			Title:     fmt.Sprintf("Closed step %d", i),
+			Status:    types.StatusClosed,
+			Priority:  2,
+			IssueType: types.TypeTask,
+		}
+		if i > 0 {
+			fakeStore.deps = append(fakeStore.deps, &types.Dependency{
+				IssueID:     id,
+				DependsOnID: fmt.Sprintf("ga-closed-%04d", i-1),
+				Type:        types.DepParentChild,
+			})
+		}
+	}
+
+	nodes := []GraphApplyNode{
+		{Key: "root", Title: "Root", Type: "epic"},
+	}
+	parentKey := "root"
+	for i := 0; i < 30; i++ {
+		key := fmt.Sprintf("step-%02d", i)
+		nodes = append(nodes, GraphApplyNode{
+			Key:       key,
+			Title:     fmt.Sprintf("Step %d", i),
+			Type:      "task",
+			ParentKey: parentKey,
+		})
+		parentKey = key
+	}
+
+	started := time.Now()
+	if _, err := executeGraphApply(
+		ctx,
+		&GraphApplyPlan{Nodes: nodes},
+		GraphApplyOptions{},
+	); err != nil {
+		t.Fatalf("executeGraphApply: %v", err)
+	}
+	if got := fakeStore.sqlCycleCheckCalls; got != 0 {
+		t.Fatalf("SQL cycle check calls = %d, want 0", got)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("elapsed = %s, want less than 1s", elapsed)
+	}
+}
+
+func TestExecuteGraphApplyUnitExistingParentKeepsCycleCheck(t *testing.T) {
+	ctx, fakeStore := withGraphApplyFakeStore(t)
+	if err := fakeStore.CreateIssue(ctx, &types.Issue{
+		ID:        "ga-existing-parent",
+		Title:     "Existing parent",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeEpic,
+	}, actor); err != nil {
+		t.Fatalf("CreateIssue(existing parent): %v", err)
+	}
+
+	if _, err := executeGraphApply(
+		ctx,
+		&GraphApplyPlan{Nodes: []GraphApplyNode{
+			{
+				Key:      "child",
+				Title:    "Child",
+				Type:     "task",
+				ParentID: "ga-existing-parent",
+			},
+		}},
+		GraphApplyOptions{},
+	); err != nil {
+		t.Fatalf("executeGraphApply: %v", err)
+	}
+	if got := fakeStore.sqlCycleCheckCalls; got != 1 {
+		t.Fatalf("SQL cycle check calls = %d, want 1", got)
+	}
 }
 
 func TestExecuteGraphApplyUnitRejectsMixedLocalExternalBlockingCycle(t *testing.T) {

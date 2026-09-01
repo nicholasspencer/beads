@@ -628,7 +628,10 @@ func executeGraphApply(ctx context.Context, plan *GraphApplyPlan, opts GraphAppl
 					DependsOnID: parentID,
 					Type:        types.DepParentChild,
 				}
-				if err := tx.AddDependency(ctx, dep, actor); err != nil {
+				addOpts := storage.DependencyAddOptions{
+					SkipCycleCheck: node.ParentKey != "",
+				}
+				if err := tx.AddDependencyWithOptions(ctx, dep, actor, addOpts); err != nil {
 					return fmt.Errorf("node %q: adding parent-child dep: %w", node.Key, err)
 				}
 			}
