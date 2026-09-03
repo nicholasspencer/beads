@@ -183,13 +183,38 @@ func TestCycleReachabilityQueryMultipleTablesTraversesUniqueNodes(t *testing.T) 
 	if strings.Contains(query, "UNION ALL") || strings.Contains(query, "depth") {
 		t.Fatalf("multi-table cycle query should traverse unique nodes, not enumerate paths:\n%s", query)
 	}
-	if !strings.Contains(query, "FROM dependencies") {
-		t.Fatalf("query does not include dependencies table:\n%s", query)
+	if strings.Contains(query, "JOIN (SELECT") {
+		t.Fatalf("multi-table cycle query must not re-materialize a derived dependency union on every hop:\n%s", query)
 	}
-	if !strings.Contains(query, "FROM wisp_dependencies") {
-		t.Fatalf("query does not include wisp_dependencies table:\n%s", query)
+	if !strings.Contains(query, "JOIN dependencies d ON d.issue_id = r.node") {
+		t.Fatalf("query does not join dependencies directly on issue_id:\n%s", query)
+	}
+	if !strings.Contains(query, "JOIN wisp_dependencies d ON d.issue_id = r.node") {
+		t.Fatalf("query does not join wisp_dependencies directly on issue_id:\n%s", query)
+	}
+	if got := strings.Count(query, "FROM reachable r"); got != 2 {
+		t.Fatalf("expected one recursive member per table, got %d:\n%s", got, query)
 	}
 	if !strings.Contains(query, DepTargetExpr) {
 		t.Fatalf("query does not resolve depends_on_id via DepTargetExpr:\n%s", query)
+	}
+}
+
+func TestAncestorReachabilityQueryJoinsEachTableDirectly(t *testing.T) {
+	query := ancestorReachabilityQuery([]string{"dependencies", "wisp_dependencies"})
+	if strings.Contains(query, "JOIN (SELECT") {
+		t.Fatalf("ancestry query must not re-materialize a derived dependency union on every hop:\n%s", query)
+	}
+	if !strings.Contains(query, "JOIN dependencies d ON d.issue_id = a.node AND d.type = 'parent-child'") {
+		t.Fatalf("ancestry query does not join dependencies directly on issue_id:\n%s", query)
+	}
+	if !strings.Contains(query, "JOIN wisp_dependencies d ON d.issue_id = a.node AND d.type = 'parent-child'") {
+		t.Fatalf("ancestry query does not join wisp_dependencies directly on issue_id:\n%s", query)
+	}
+	if got := strings.Count(query, "FROM ancestors a"); got != 2 {
+		t.Fatalf("expected one recursive member per table, got %d:\n%s", got, query)
+	}
+	if !strings.Contains(query, DepTargetExpr) {
+		t.Fatalf("ancestry query does not resolve the parent via DepTargetExpr:\n%s", query)
 	}
 }

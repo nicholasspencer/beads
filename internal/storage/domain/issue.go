@@ -880,6 +880,15 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 	// Pass 3 — insert node parent-child deps now that all IDs are known. These
 	// must be visible before any blocking edge in the same plan so the storage
 	// hierarchy guard evaluates existing + planned ancestry.
+	//
+	// CycleValidated is set on both Inserts below: the two preflights above and
+	// the final CycleThroughEdges walk over newSchedulingEdges are the cycle
+	// authority for this plan, and all of it runs inside one transaction, so a
+	// cycle detected at the end rolls the whole apply back. Per-edge HasCycle
+	// re-ran the recursive reachability CTE once per edge for an answer the
+	// whole-graph walk already gives once. The hierarchy guard is deliberately
+	// NOT declared validated: no whole-graph hierarchy preflight exists, so
+	// ValidateBlockingHierarchy still runs per edge.
 	for _, node := range plan.Nodes {
 		parentID := node.ParentID
 		if node.ParentKey != "" {
@@ -894,7 +903,7 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 			DependsOnID: parentID,
 			Type:        types.DepParentChild,
 		}
-		if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp}); err != nil {
+		if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp, CycleValidated: true}); err != nil {
 			return GraphApplyResult{}, fmt.Errorf("applyGraph: node %q: parent-child dep %s->%s: %w", node.Key, childID, parentID, err)
 		}
 		newSchedulingEdges = append(newSchedulingEdges, [2]string{childID, parentID})
@@ -944,7 +953,7 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 				DependsOnID: toID,
 				Type:        depType,
 			}
-			if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp}); err != nil {
+			if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp, CycleValidated: true}); err != nil {
 				return GraphApplyResult{}, fmt.Errorf("applyGraph: edge %d (%s -> %s): %w", i, fromID, toID, err)
 			}
 			if isSchedulingDep(depType) {

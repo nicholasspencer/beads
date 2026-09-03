@@ -62,6 +62,56 @@ func TestAddDependencyRejectsWispEndpointCycleThroughPermanent(t *testing.T) {
 	assertCycleError(t, err)
 }
 
+func TestAddDependencyAcceptsCrossTableDiamond(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	const (
+		permTop  = "diamond-perm-top"
+		wispLeft = "diamond-wisp-left"
+		permMid  = "diamond-perm-mid"
+		permEnd  = "diamond-perm-end"
+	)
+	createPerm(t, ctx, store, permTop)
+	createWisp(t, ctx, store, wispLeft)
+	createPerm(t, ctx, store, permMid)
+	createPerm(t, ctx, store, permEnd)
+
+	// Two distinct paths top -> end, one of them through the wisp table.
+	mustAddBlockingDependency(t, ctx, store, permTop, wispLeft)
+	mustAddBlockingDependency(t, ctx, store, wispLeft, permEnd)
+	mustAddBlockingDependency(t, ctx, store, permTop, permMid)
+
+	// Closing the diamond is not a cycle and must be accepted.
+	mustAddBlockingDependency(t, ctx, store, permMid, permEnd)
+}
+
+func TestAddDependencyRejectsSelfDependency(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	const solo = "self-dep-perm"
+	createPerm(t, ctx, store, solo)
+
+	err := store.AddDependency(ctx, &types.Dependency{
+		IssueID:     solo,
+		DependsOnID: solo,
+		Type:        types.DepBlocks,
+	}, "tester")
+	if err == nil {
+		t.Fatal("expected AddDependency to reject a self-dependency, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "cannot depend on itself") {
+		t.Fatalf("expected self-dependency error, got: %v", err)
+	}
+}
+
 func mustAddBlockingDependency(t *testing.T, ctx context.Context, store *DoltStore, issueID, dependsOnID string) {
 	t.Helper()
 	if err := store.AddDependency(ctx, &types.Dependency{

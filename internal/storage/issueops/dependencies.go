@@ -444,35 +444,31 @@ func WouldCreateSchedulingCycleInTx(ctx context.Context, tx DBTX, issueID, depen
 // blocked parent propagates its blocked state to its children in the
 // ready-work computation, so a chain mixing blocks and parent-child edges
 // can form a logical livelock that prevents anything from being ready.
+//
+// Each dependency table gets its OWN recursive member, joined directly on
+// issue_id, so a hop is an indexed lookup instead of a scan of a derived
+// union. The earlier multi-table form joined the recursion against
+// JOIN (SELECT ... UNION SELECT ...): that derived table carries no index and
+// the engine re-materializes it on every hop, costing (blocking rows in the
+// union) x (chain depth). Measured on a 22GB store with 4403 blocking rows,
+// 109.6ms for one deep edge versus 2.8ms per-table; reproduced offline on a
+// 4029-row store at 92.32ms versus 2.65ms.
 func cycleReachabilityQuery(depTables []string) string {
-	if len(depTables) == 1 {
-		return fmt.Sprintf(`
-			WITH RECURSIVE reachable(node) AS (
-				SELECT ?
-				UNION
-				SELECT %s
-				FROM reachable r
-				JOIN %s d ON d.issue_id = r.node AND d.type IN ('blocks', 'conditional-blocks', 'parent-child')
-			)
-			SELECT COUNT(*) FROM reachable WHERE node = ?
-		`, DepTargetExpr, depTables[0])
-	}
-
-	var unions []string
+	members := make([]string, 0, len(depTables))
 	for _, t := range depTables {
-		unions = append(unions, fmt.Sprintf("SELECT issue_id, %s AS depends_on_id FROM %s WHERE type IN ('blocks', 'conditional-blocks', 'parent-child')", DepTargetExpr, t))
+		members = append(members, fmt.Sprintf(`
+			SELECT %s
+			FROM reachable r
+			JOIN %s d ON d.issue_id = r.node AND d.type IN ('blocks', 'conditional-blocks', 'parent-child')`,
+			DepTargetExpr, t))
 	}
-	unionQuery := strings.Join(unions, " UNION ")
 	return fmt.Sprintf(`
 		WITH RECURSIVE reachable(node) AS (
 			SELECT ?
-			UNION
-			SELECT d.depends_on_id
-			FROM reachable r
-			JOIN (%s) d ON d.issue_id = r.node
+			UNION%s
 		)
 		SELECT COUNT(*) FROM reachable WHERE node = ?
-	`, unionQuery)
+	`, strings.Join(members, "\n\t\t\tUNION"))
 }
 
 func cycleDetectionTables() []string {
@@ -525,26 +521,38 @@ func CheckBlockingHierarchyInTx(ctx context.Context, tx DBTX, dep *types.Depende
 	return nil
 }
 
+// ancestorReachabilityQuery builds the parent-child ancestry walk used by
+// isAncestorInTx: one indexed recursive member per dependency table, joined
+// directly on issue_id. Like cycleReachabilityQuery, the earlier form joined
+// the recursion against a derived, un-indexed UNION of the dependency tables,
+// which the engine re-materializes on every hop. ValidateBlockingHierarchy
+// calls isAncestorInTx TWICE per blocking-edge insert and has no skip flag, so
+// the derived form was paid twice for every stored blocking edge.
+func ancestorReachabilityQuery(depTables []string) string {
+	members := make([]string, 0, len(depTables))
+	for _, t := range depTables {
+		members = append(members, fmt.Sprintf(`
+			SELECT %s
+			FROM ancestors a
+			JOIN %s d ON d.issue_id = a.node AND d.type = 'parent-child'`,
+			DepTargetExpr, t))
+	}
+	return fmt.Sprintf(`
+		WITH RECURSIVE ancestors(node) AS (
+			SELECT ?
+			UNION%s
+		)
+		SELECT COUNT(*) FROM ancestors WHERE node = ?
+	`, strings.Join(members, "\n\t\t\tUNION"))
+}
+
 // isAncestorInTx reports whether candidate is an ancestor of node along
 // parent-child dependency edges (walking child -> parent only, so siblings
 // and cousins in the same hierarchy do not match). Uses UNION distinct
 // recursion so diamond/cyclic parentage terminates by unique reachable node.
 func isAncestorInTx(ctx context.Context, tx DBTX, node, candidate string, depTables []string) (bool, error) {
-	var unions []string
-	for _, t := range depTables {
-		unions = append(unions, fmt.Sprintf("SELECT issue_id, %s AS parent_id FROM %s WHERE type = 'parent-child'", DepTargetExpr, t))
-	}
 	//nolint:gosec // G201: depTables are fixed dependency table names from cycleDetectionTables/opts.
-	query := fmt.Sprintf(`
-		WITH RECURSIVE ancestors(node) AS (
-			SELECT ?
-			UNION
-			SELECT d.parent_id
-			FROM ancestors a
-			JOIN (%s) d ON d.issue_id = a.node
-		)
-		SELECT COUNT(*) FROM ancestors WHERE node = ?
-	`, strings.Join(unions, " UNION "))
+	query := ancestorReachabilityQuery(depTables)
 	var n int
 	if err := tx.QueryRowContext(ctx, query, node, candidate).Scan(&n); err != nil {
 		return false, err
